@@ -91,17 +91,17 @@ def _print_summary(ir: dict) -> None:
     summary = ir.get("geometry_primitives", {}).get("summary", {})
     bom = ir.get("bill_of_materials", {})
 
-    print(f"\n{'─'*52}")
+    print(f"\n{'-'*52}")
     print(f"  La Vinci CAD IR Summary")
-    print(f"{'─'*52}")
+    print(f"{'-'*52}")
     print(f"  Format:           {fmt}")
     print(f"  Source:           {meta.get('source_file', 'N/A')}")
     print(f"  CAD Version:      {meta.get('cad_version', 'N/A')}")
     print(f"  Measurement:      {meta.get('measurement_system', 'N/A')}")
     w = extents.get("width", 0)
     h = extents.get("height", 0)
-    print(f"  Canvas:           {w} × {h} (width × height)")
-    print(f"{'─'*52}")
+    print(f"  Canvas:           {w} x {h} (width x height)")
+    print(f"{'-'*52}")
     print(f"  Layers:           {len(ir.get('layers', []))}")
     print(f"  Block Defs:       {summary.get('total_block_definitions', 0)}")
     print(f"  Lines:            {summary.get('total_lines', 0)}")
@@ -118,7 +118,7 @@ def _print_summary(ir: dict) -> None:
             print(f"    {name:<36} {count}")
         if len(bom) > 10:
             print(f"    ... and {len(bom) - 10} more")
-    print(f"{'─'*52}\n")
+    print(f"{'-'*52}\n")
 
 
 if __name__ == "__main__":
