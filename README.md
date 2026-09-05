@@ -147,6 +147,46 @@ doc.saveas("/tmp/output.dxf")
 
 ---
 
+## ⚙️ Compilation Presets & Configuration Architecture
+
+An Intermediate Representation (`LAVINCI_CAD_IR_V3`) is the **Single Source of Truth** for pure geometry and semantic data. A DXF file, by contrast, is a **rendered target document** whose packaging depends on the recipient's software, machine workflow, or printing needs.
+
+The relationship between IR and DXF is fundamentally **One-to-Many**: a single IR payload can be compiled into multiple specialized DXF presets.
+
+### Active Default Configuration
+
+The current `cad-ir-to-dxf` engine compiles using a **True-Scale Model-Space Master Profile**:
+
+| Parameter Group | Parameter | Active Default | Description / Design Rationale |
+| :--- | :--- | :--- | :--- |
+| **DXF Version** | `dxf_version` | `R2013` (AC1027) | AutoCAD 2013 standard. Universal compatibility across modern CAD/BIM tools (2013–2026, Revit, Rhino, Fusion 360). |
+| **Encoding** | `encoding` | `UTF-8` | Full Unicode support preventing symbol and foreign language character corruption. |
+| **Target Space** | `target_space` | `ModelSpace` | Real-world 1:1 coordinate space. Geometry matches true physical dimensions for direct measuring and editing. |
+| **Spatial Units** | `$INSUNITS` | From IR (or Metric `4` = mm) | Retains original scale and insertion units captured from the source drawing. |
+| **Measurement** | `$MEASUREMENT` | `1` (Metric) / `0` (Imperial) | Controls default linetype definitions and hatch pattern scaling matching the source drawing. |
+| **Vector Geometry** | `primitives` | Native Analytic Vectors | `ARC`, `CIRCLE`, `LWPOLYLINE`, `ELLIPSE`, and `SPLINE` are preserved mathematically without polygonal faceting. |
+| **Block Topology** | `blocks` | Hierarchical `INSERT` + `BLOCK_RECORD` | Compact vector reuse. Components reference centralized symbol geometry definitions. |
+| **Attributes** | `attributes` | Attached `ATTRIB` tags | Component tags and instance attributes are bound to their respective block insertions. |
+| **Layer Fidelity** | `layers` | Explicit State Mapping | Layers retain `is_off`, `is_frozen`, `is_locked`, `color`, and `linetype` states verbatim. |
+| **Color Fidelity** | `color_mode` | TrueColor (24-bit RGB) + ACI | Preserves full 24-bit color fidelity with automatic fallback to standard AutoCAD Color Index. |
+| **Sanitization** | `zero_length_tol` | `1e-9` | Rejects degenerate micro-geometry without affecting legitimate fine details. |
+
+### Presets & Customization Roadmap
+
+In upcoming releases, `cad-ir-to-dxf` will expose first-class preset profiles and customization flags:
+
+1. **AutoCAD Compatibility Presets**:
+   * `--preset cnc-r12`: Downgrades all modern curves and polylines to legacy R12 (AC1009) 3D lines for older CNC routers, laser cutters, and CAM machinery.
+   * `--preset modern`: Standard R2018/R2013 output with full modern feature support.
+2. **Paper Space & Sheet Layout Presets**:
+   * `--layout [A4|A3|A1|A0|ARCH_D]`: Automatically provisions Paper Space layout viewports with printable margins, border frames, and title blocks.
+   * `--orientation [portrait|landscape]`: Controls sheet rotation for client-ready presentation drawings.
+   * `--scale [1:20|1:50|1:100|fit]`: Sets analytical viewport camera scale.
+3. **Semantic Layer Filtering Presets**:
+   * `--filter-preset [furniture|structural|mep|clean]`: Selective layer inclusion/exclusion for specialized trade deliverables.
+
+---
+
 ## 🧪 Test Results
 
 ```
