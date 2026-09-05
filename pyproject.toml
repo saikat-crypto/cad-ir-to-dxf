@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cad-ir-to-dxf"
+version = "1.0.0"
+authors = [
+  { name="Saikat Dutta Chowdhury" },
+]
+description = "La Vinci CAD IR → DXF Compiler. Converts LAVINCI_CAD_IR_V3 JSON into industry-standard DXF files."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["cad", "dxf", "dwg", "converter", "engineering", "bim", "lavinci"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "ezdxf>=1.4.0",
+    "pydantic>=2.0.0",
+]
+
+[project.scripts]
+cad-ir-to-dxf = "cad_ir_to_dxf.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
