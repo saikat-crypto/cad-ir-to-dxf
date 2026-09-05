@@ -1,92 +1,155 @@
 """
-sanitizer.py — Geometry validation & degenerate filtering for IR v3 entities.
+sanitizer.py — Robust Geometry Validation, Name Sanitization & Defect Guards.
 
 Defends the DXF compiler against malformed input that would silently corrupt
 or crash the output file:
-  - Zero-length lines
+  - Non-finite (NaN / Inf) coordinates & extreme coordinates
+  - 1D, empty, non-numeric, or malformed coordinate lists
+  - 3D vertical lines (dx=0, dy=0, dz!=0)
   - Zero / negative radius arcs and circles
-  - Under-specified polylines (< 2 vertices)
-  - Non-finite (NaN / Inf) coordinates
-  - Zero-scale block insertions
+  - Under-specified or degenerate polylines
+  - Prohibited characters in AutoCAD symbol names (layers, blocks, layouts)
+  - Sub-epsilon and negative zero scale reflection inversion
 """
 
 import math
-from typing import List, Optional, Tuple
+import re
+from typing import Any, List, Optional, Tuple
 
-_EPSILON = 1e-6  # Minimum meaningful geometric size
-
-
-def is_finite(*values: float) -> bool:
-    """Return True if every value is a finite real number (not NaN, not Inf)."""
-    return all(math.isfinite(v) for v in values)
+_EPSILON = 1e-6          # Minimum meaningful geometric size
+_MAX_COORD = 1e12        # Maximum realistic CAD coordinate to prevent overflow
+_INVALID_NAME_CHARS = re.compile(r'[<>/\":;?|=,\'\x00-\x1f]')
 
 
-def validate_line(start: List[float], end: List[float]) -> bool:
-    """
-    A line is valid if:
-    - Both endpoints have finite coordinates.
-    - The distance between start and end is greater than epsilon.
-    """
-    if not is_finite(*start, *end):
-        return False
-    dx = end[0] - start[0]
-    dy = end[1] - start[1]
-    return math.hypot(dx, dy) > _EPSILON
-
-
-def validate_arc(center: List[float], radius: float,
-                 start_angle: float, end_angle: float) -> bool:
-    """
-    An arc is valid if:
-    - Center coordinates are finite.
-    - Radius is positive and greater than epsilon.
-    - Angles are finite real numbers.
-    """
-    if not is_finite(*center, radius, start_angle, end_angle):
-        return False
-    return radius > _EPSILON
-
-
-def validate_circle(center: List[float], radius: float) -> bool:
-    """
-    A circle is valid if:
-    - Center coordinates are finite.
-    - Radius is positive and greater than epsilon.
-    """
-    if not is_finite(*center, radius):
-        return False
-    return radius > _EPSILON
-
-
-def validate_polyline(points: List[List[float]]) -> bool:
-    """
-    A polyline is valid if:
-    - It has at least 2 vertices.
-    - All vertex coordinates are finite.
-    """
-    if len(points) < 2:
-        return False
-    for pt in points:
-        if not is_finite(*pt):
+def is_numeric_and_finite(*values: Any) -> bool:
+    """Return True if every value is a real number (not None, not bool, not str) and is finite."""
+    for v in values:
+        if v is None or isinstance(v, bool) or not isinstance(v, (int, float)):
+            return False
+        if not math.isfinite(float(v)):
+            return False
+        if abs(float(v)) > _MAX_COORD:
             return False
     return True
 
 
-def clamp_scale(scale: List[float], minimum: float = 1e-6) -> Tuple[float, float, float]:
+# Backward-compatibility alias
+is_finite = is_numeric_and_finite
+
+
+def sanitize_symbol_name(name: Any, fallback: str = "0") -> str:
     """
-    Ensure insertion scale factors are not zero or sub-epsilon.
-    Preserves sign (negative scale = mirror), but clamps magnitude to minimum.
+    Sanitize layer, block, and layout names to comply with AutoCAD requirements.
+    Replaces prohibited characters [<>/\":;?*|=,'] with underscores.
     """
-    def _clamp(v: float) -> float:
-        if abs(v) < minimum:
-            return minimum  # Default to 1 if effectively zero
-        return v
-    return (_clamp(scale[0]), _clamp(scale[1]), _clamp(scale[2] if len(scale) > 2 else 1.0))
+    if name is None:
+        return fallback
+    clean = _INVALID_NAME_CHARS.sub("_", str(name)).strip()
+    return clean if clean else fallback
+
+
+def validate_line(start: Any, end: Any) -> bool:
+    """
+    A line is valid if:
+    - Both endpoints are list/tuple with at least 2 numeric, finite coordinates.
+    - 3D Euclidean distance between start and end is greater than epsilon
+      (preserves vertical 3D lines where dx=0, dy=0, dz!=0).
+    """
+    if not (isinstance(start, (list, tuple)) and isinstance(end, (list, tuple))):
+        return False
+    if len(start) < 2 or len(end) < 2:
+        return False
+    if not (is_numeric_and_finite(*start[:2]) and is_numeric_and_finite(*end[:2])):
+        return False
+
+    z1 = float(start[2]) if len(start) > 2 and is_numeric_and_finite(start[2]) else 0.0
+    z2 = float(end[2]) if len(end) > 2 and is_numeric_and_finite(end[2]) else 0.0
+
+    p1 = (float(start[0]), float(start[1]), z1)
+    p2 = (float(end[0]), float(end[1]), z2)
+
+    return math.dist(p1, p2) > _EPSILON
+
+
+def validate_arc(center: Any, radius: Any,
+                 start_angle: Any, end_angle: Any) -> bool:
+    """
+    An arc is valid if:
+    - Center is a list/tuple of at least 2 finite coordinates.
+    - Radius is a positive finite number greater than epsilon.
+    - Start and end angles are finite numbers.
+    """
+    if not (isinstance(center, (list, tuple)) and len(center) >= 2):
+        return False
+    if not is_numeric_and_finite(center[0], center[1], radius, start_angle, end_angle):
+        return False
+    return float(radius) > _EPSILON
+
+
+def validate_circle(center: Any, radius: Any) -> bool:
+    """
+    A circle is valid if:
+    - Center is a list/tuple of at least 2 finite coordinates.
+    - Radius is a positive finite number greater than epsilon.
+    """
+    if not (isinstance(center, (list, tuple)) and len(center) >= 2):
+        return False
+    if not is_numeric_and_finite(center[0], center[1], radius):
+        return False
+    return float(radius) > _EPSILON
+
+
+def validate_polyline(points: Any) -> bool:
+    """
+    A polyline is valid if:
+    - Points is a sequence of at least 2 vertices.
+    - Each vertex is a list/tuple of at least 2 finite numbers.
+    - Not all vertices are coincident.
+    """
+    if not isinstance(points, (list, tuple)) or len(points) < 2:
+        return False
+    first_pt = None
+    has_non_coincident = False
+    for pt in points:
+        if not (isinstance(pt, (list, tuple)) and len(pt) >= 2):
+            return False
+        if not is_numeric_and_finite(pt[0], pt[1]):
+            return False
+        curr_xy = (float(pt[0]), float(pt[1]))
+        if first_pt is None:
+            first_pt = curr_xy
+        elif not has_non_coincident:
+            if math.dist(first_pt, curr_xy) > _EPSILON:
+                has_non_coincident = True
+    return has_non_coincident
+
+
+def clamp_scale(scale_raw: Any, minimum: float = _EPSILON) -> Tuple[float, float, float]:
+    """
+    Ensure insertion scale factors are valid, non-zero, finite numbers.
+    Preserves sign (negative scale = mirror reflection) using math.copysign.
+    """
+    if not isinstance(scale_raw, (list, tuple)):
+        return (1.0, 1.0, 1.0)
+
+    def _clamp(v: Any) -> float:
+        if not is_numeric_and_finite(v):
+            return 1.0
+        v_flt = float(v)
+        if abs(v_flt) < minimum:
+            # Preserve negative sign using copysign!
+            return math.copysign(minimum, v_flt if v_flt != 0.0 else 1.0)
+        return v_flt
+
+    sx = _clamp(scale_raw[0]) if len(scale_raw) > 0 else 1.0
+    sy = _clamp(scale_raw[1]) if len(scale_raw) > 1 else 1.0
+    sz = _clamp(scale_raw[2]) if len(scale_raw) > 2 else 1.0
+    return (sx, sy, sz)
 
 
 def sanitize_color(color: Optional[str]) -> Optional[str]:
     """
-    Validates a hex color string.
+    Validates a color string.
     Returns None (BYLAYER) if the string is malformed, empty, or None.
     """
     if color is None:

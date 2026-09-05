@@ -6,3 +6,7 @@ build/
 *.dxf
 *.dwg
 .env
+.agents/
+tests/artifacts/
+uv.lock
+
