@@ -171,33 +171,82 @@ The current `cad-ir-to-dxf` engine compiles using a **True-Scale Model-Space Mas
 | **Color Fidelity** | `color_mode` | TrueColor (24-bit RGB) + ACI | Preserves full 24-bit color fidelity with automatic fallback to standard AutoCAD Color Index. |
 | **Sanitization** | `zero_length_tol` | `1e-9` | Rejects degenerate micro-geometry without affecting legitimate fine details. |
 
-### Presets & Customization Roadmap
+### 5 Curated Safe Presets
 
-In upcoming releases, `cad-ir-to-dxf` will expose first-class preset profiles and customization flags:
+| Preset | Target DXF | Space | Key Characteristics & Target Workflows |
+| :--- | :--- | :--- | :--- |
+| **`standard`** *(default)* | `R2013` (AC1027) | ModelSpace | High-fidelity master profile: native analytic curves, TrueColor, hierarchical blocks, full layers. |
+| **`cnc_cam`** | `R12` (AC1009) | ModelSpace | Flat 2D ($Z=0$), block definitions exploded, annotations & dimensions omitted to prevent cutting labels. |
+| **`arch_print`** | `R2013` (AC1027) | PaperSpace | Auto-provisions `Presentation_Sheet` layout tab with printable border and scaled viewport. |
+| **`web_lightweight`** | `R2000` (AC1015) | ModelSpace | Compact output for web viewers (three.js), stripped tables, ACI color, dimensions omitted. |
+| **`bim_overlay`** | `R2018` (AC1032) | ModelSpace | Strict world-origin coordinate lock; `IR_` layer prefix to prevent layer collisions in Revit. |
 
-1. **AutoCAD Compatibility Presets**:
-   * `--preset cnc-r12`: Downgrades all modern curves and polylines to legacy R12 (AC1009) 3D lines for older CNC routers, laser cutters, and CAM machinery.
-   * `--preset modern`: Standard R2018/R2013 output with full modern feature support.
-2. **Paper Space & Sheet Layout Presets**:
-   * `--layout [A4|A3|A1|A0|ARCH_D]`: Automatically provisions Paper Space layout viewports with printable margins, border frames, and title blocks.
-   * `--orientation [portrait|landscape]`: Controls sheet rotation for client-ready presentation drawings.
-   * `--scale [1:20|1:50|1:100|fit]`: Sets analytical viewport camera scale.
-3. **Semantic Layer Filtering Presets**:
-   * `--filter-preset [furniture|structural|mep|clean]`: Selective layer inclusion/exclusion for specialized trade deliverables.
+---
+
+## 🛡️ Developer Diagnostic Engine & Error Messages
+
+For production library consumers and external developers, `cad-ir-to-dxf` provides actionable, typed errors and compilation diagnostic telemetry instead of cryptic Python tracebacks.
+
+### 1. Custom Exception Hierarchy (`exceptions.py`)
+All exceptions inherit from `CadIrToDxfError` and carry three properties:
+* **`message`**: Clear explanation of what failed.
+* **`offender`**: The exact bad value, key, or entity causing the issue.
+* **`hint`**: Actionable guidance explaining how to resolve it.
+
+```python
+from cad_ir_to_dxf import compile_ir_to_dxf, InvalidPresetError, StrictModeViolationError
+
+try:
+    doc = compile_ir_to_dxf("plan.json", preset="cnc-cam")
+except InvalidPresetError as e:
+    print(e.message)   # "Unknown preset 'cnc-cam'. Did you mean 'cnc_cam'?"
+    print(e.hint)      # "Valid presets are: ['standard', 'cnc_cam', 'arch_print', ...]"
+    print(e.offender)  # "cnc-cam"
+```
+
+### 2. Compilation Diagnostics (`diagnostics.py`)
+Non-fatal events (e.g., auto-vivified layers, dropped micro-geometry, suppressed annotation text) are gathered into a structured diagnostic report:
+
+```python
+from cad_ir_to_dxf import compile_ir_to_dxf, CompilationDiagnostics
+
+diag = CompilationDiagnostics()
+doc = compile_ir_to_dxf("plan.json", preset="cnc_cam", diagnostics=diag)
+
+# Print human-readable summary to stderr
+diag.print_report()
+
+# Or inspect programmatically:
+report = diag.to_dict()
+```
+
+CLI usage:
+```bash
+# Print diagnostic report
+cad-ir-to-dxf plan.json --preset cnc_cam --diagnostics
+
+# Enforce strict validation (fail fast on any missing layer or degenerate geometry)
+cad-ir-to-dxf plan.json --preset standard --strict
+```
 
 ---
 
 ## 🧪 Test Results
 
 ```
-Ran 35 tests in 0.323s — OK (0 failures, 0 errors)
+Ran 85 tests in 0.460s — OK (0 failures, 0 errors)
 
-TestSanitizer           (14 tests) — zero-length lines, NaN/Inf coords,
-                                     negative radius, wrapping arcs, scale clamping
-TestCompilerSmoke       ( 8 tests) — smoke compilation of all 8 real-world example IRs
-TestCompilerFidelity    ( 8 tests) — layer fidelity, block geometry, BYLAYER colour,
-                                     arc angle preservation, annotation output
-TestBoundaryConditions  ( 3 tests) — empty IR, degenerate geometry, missing block placeholder
+TestSanitizer                  (14 tests) — zero-length lines, NaN/Inf coords, scale clamping
+TestCompilerSmoke              ( 8 tests) — smoke compilation of real-world example IRs
+TestCompilerFidelity           ( 8 tests) — layer fidelity, block geometry, BYLAYER colour
+TestBoundaryConditions         ( 4 tests) — empty IR, degenerate geometry, missing block placeholder
+TestPresetResolver             ( 7 tests) — preset profile defaults, enum and string parsing
+TestAdvancedOptionsOverrides   ( 9 tests) — version, geometry, filtering, layout, styling overrides
+TestPresetCompilationSmoke     ( 6 tests) — all 5 presets compile valid DXF outputs
+TestPresetBehaviourFunctional  (10 tests) — flatten_z, layer prefixes, layer filtering, PaperSpace
+TestExceptions                 ( 9 tests) — typed errors, actionable hints, offender inspection
+TestStrictMode                 ( 3 tests) — strict-mode enforcement for layers, blocks, geometry
+TestDiagnostics                ( 5 tests) — diagnostic telemetry, print_report, and to_dict
 ```
 
 ---

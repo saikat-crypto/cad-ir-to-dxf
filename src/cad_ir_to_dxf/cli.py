@@ -92,6 +92,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Print compilation diagnostics report (warnings, adjustments, dropped geometry) to stderr.",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Strict mode: raise errors immediately on missing layers, bad geometry, or schema warnings.",
+    )
+    parser.add_argument(
         "--summary",
         action="store_true",
         help="Print a summary of the IR content without writing a DXF file.",
@@ -146,13 +156,34 @@ def main() -> None:
         print(f"Advanced:   {json.dumps(advanced_options)}")
     print(f"Output:     {output_path}")
 
-    doc = compile_ir_to_dxf(
-        ir_source=str(ir_path),
-        output_path=output_path,
-        dxf_version=args.version or "R2013",
-        preset=preset,
-        advanced_options=advanced_options if advanced_options else None,
-    )
+    from .diagnostics import CompilationDiagnostics
+    from .exceptions import CadIrToDxfError
+
+    diag = CompilationDiagnostics() if args.diagnostics else None
+
+    try:
+        doc = compile_ir_to_dxf(
+            ir_source=str(ir_path),
+            output_path=output_path,
+            dxf_version=args.version or "R2013",
+            preset=preset,
+            advanced_options=advanced_options if advanced_options else None,
+            diagnostics=diag,
+            strict=args.strict,
+        )
+    except CadIrToDxfError as err:
+        print(f"\n[ERROR] Compilation failed: {err.message}", file=sys.stderr)
+        if err.offender is not None:
+            print(f"  Offender: {err.offender!r}", file=sys.stderr)
+        if err.hint:
+            print(f"  Fix     : {err.hint}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"\n[UNEXPECTED ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if diag is not None:
+        diag.print_report()
 
     msp = doc.modelspace()
     entity_count = len(list(msp))

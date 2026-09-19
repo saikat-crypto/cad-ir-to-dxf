@@ -55,6 +55,22 @@ from .sanitizer import (
     validate_polyline,
 )
 from .presets import ResolvedConfig, get_preset_config, PresetName, AdvancedOptions, PAPER_SIZES_MM
+from .exceptions import (
+    BlockCycleError,
+    IRFileNotFoundError,
+    IRParseError,
+    MissingFormatHeaderError,
+    InvalidPresetError,
+    InvalidOptionError,
+    InvalidPaperSizeError,
+    InvalidColorModeError,
+    InvalidDxfVersionError,
+    InvalidOrientationError,
+    InvalidViewportScaleError,
+    OutputWriteError,
+    StrictModeViolationError,
+)
+from .diagnostics import CompilationDiagnostics, Severity
 from typing import Union as _Union
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -108,6 +124,8 @@ def compile_ir_to_dxf(
     dxf_version: str = "R2013",
     preset: _Union[str, "PresetName"] = "standard",
     advanced_options: Optional[_Union["AdvancedOptions", Dict[str, Any]]] = None,
+    diagnostics: Optional["CompilationDiagnostics"] = None,
+    strict: bool = False,
 ) -> Drawing:
     """
     Compile a LAVINCI_CAD_IR_V3 payload into a DXF Drawing.
@@ -130,11 +148,36 @@ def compile_ir_to_dxf(
     advanced_options:
         Optional AdvancedOptions dataclass or plain dict of override fields.
         Only the keys you supply override the preset's baseline defaults.
+    diagnostics:
+        Optional CompilationDiagnostics instance to receive non-fatal events
+        (dropped entities, auto-created layers, filtered layers, etc.).
+        If None, diagnostics are silently discarded.
+    strict:
+        If True, non-fatal corrections (e.g. auto-creating missing layers,
+        dropping degenerate geometry) raise StrictModeViolationError instead
+        of being silently corrected.  Default: False.
 
     Returns
     -------
     ezdxf.Drawing
         The compiled, fully populated DXF document.
+
+    Raises
+    ------
+    IRFileNotFoundError
+        The given file path does not exist on disk.
+    IRParseError
+        The source string/file cannot be parsed as valid JSON.
+    MissingFormatHeaderError
+        The IR payload is missing the 'format' key or declares a wrong schema.
+    InvalidPresetError
+        An unrecognised preset name was provided.
+    InvalidOptionError
+        An AdvancedOptions field has an unsupported value.
+    OutputWriteError
+        The compiled DXF cannot be written to output_path.
+    StrictModeViolationError
+        (strict=True only) A non-fatal correction was attempted.
 
     Examples
     --------
@@ -142,28 +185,70 @@ def compile_ir_to_dxf(
     >>> doc = compile_ir_to_dxf("plan.json", preset="cnc_cam")
     >>> doc = compile_ir_to_dxf("plan.json", preset="arch_print",
     ...     advanced_options={"layout": {"paper_size": "ISO_A1"}})
+    >>> diag = CompilationDiagnostics()
+    >>> doc = compile_ir_to_dxf("plan.json", diagnostics=diag)
+    >>> diag.print_report()
     """
-    cfg = get_preset_config(preset, advanced_options)
+    # ── Resolve & validate preset ────────────────────────────────────────────
+    try:
+        cfg = get_preset_config(preset, advanced_options)
+    except ValueError as e:
+        raise InvalidPresetError(str(preset)) from e
 
-    # Allow dxf_version kwarg to override the preset version (backward compat)
+    # ── Validate AdvancedOptions fields that have constrained value sets ─────
+    _VALID_DXF_VERSIONS = {"R12", "R2000", "R2004", "R2007", "R2010", "R2013", "R2018"}
+    _VALID_COLOR_MODES  = {"truecolor", "aci", "monochrome"}
+    _VALID_ORIENTATIONS = {"landscape", "portrait"}
+
+    if cfg.dxf_version not in _VALID_DXF_VERSIONS:
+        raise InvalidDxfVersionError(cfg.dxf_version)
+    if cfg.color_mode not in _VALID_COLOR_MODES:
+        raise InvalidColorModeError(cfg.color_mode)
+    if cfg.orientation.lower() not in _VALID_ORIENTATIONS:
+        raise InvalidOrientationError(cfg.orientation)
+    if cfg.paper_size.upper() not in PAPER_SIZES_MM:
+        raise InvalidPaperSizeError(cfg.paper_size, list(PAPER_SIZES_MM.keys()))
+    if cfg.viewport_scale not in ("auto",) and cfg.viewport_scale:
+        # Validate ratio format like '1:50', '1:100', '1:1'
+        parts = cfg.viewport_scale.split(":")
+        try:
+            if len(parts) == 2:
+                float(parts[0]); float(parts[1])
+            elif len(parts) == 1:
+                float(parts[0])
+            else:
+                raise ValueError
+        except (ValueError, TypeError):
+            raise InvalidViewportScaleError(cfg.viewport_scale)
+
+    # ── Allow dxf_version kwarg to override preset version (backward compat) ─
     if dxf_version != "R2013":
+        if dxf_version not in _VALID_DXF_VERSIONS:
+            raise InvalidDxfVersionError(dxf_version)
         cfg.dxf_version = dxf_version
 
-    ir = _load_ir(ir_source)
+    # ── Set up diagnostics collector ─────────────────────────────────────────
+    diag = diagnostics if diagnostics is not None else CompilationDiagnostics()
+
+    # ── Load IR ──────────────────────────────────────────────────────────────
+    ir = _load_ir(ir_source, diag, strict)
 
     doc = ezdxf.new(cfg.dxf_version, setup=True)
 
     _configure_header(doc, ir, cfg)
     _load_linetypes(doc)
     _build_layer_table(doc, ir, cfg)
-    _build_block_definitions(doc, ir, cfg)
-    _populate_spaces(doc, ir, cfg)
+    _build_block_definitions(doc, ir, cfg, diag, strict)
+    _populate_spaces(doc, ir, cfg, diag, strict)
 
     if cfg.create_paper_space:
-        _build_paper_space_layout(doc, ir, cfg)
+        _build_paper_space_layout(doc, ir, cfg, diag)
 
     if output_path is not None:
-        doc.saveas(str(output_path))
+        try:
+            doc.saveas(str(output_path))
+        except OSError as e:
+            raise OutputWriteError(str(output_path), str(e)) from e
 
     return doc
 
@@ -172,26 +257,68 @@ def compile_ir_to_dxf(
 # Stage 1 — Load & parse the IR (with Pydantic & null safety)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _load_ir(source: Union[str, Path, Dict[str, Any], Any]) -> Dict[str, Any]:
-    """Return the IR as a plain Python dict with safe dictionary defaults."""
+def _load_ir(
+    source: Union[str, Path, Dict[str, Any], Any],
+    diag: "CompilationDiagnostics",
+    strict: bool = False,
+) -> Dict[str, Any]:
+    """
+    Return the IR as a plain Python dict with safe dictionary defaults.
+
+    Raises
+    ------
+    IRFileNotFoundError    File path given but does not exist.
+    IRParseError           Source string or file is not valid JSON.
+    MissingFormatHeaderError  Payload has no 'format' key or wrong schema.
+    """
     # 1. Pydantic model support
     if hasattr(source, "model_dump") and callable(source.model_dump):
-        return source.model_dump()
-    if hasattr(source, "dict") and callable(source.dict):
-        return source.dict()
-
+        data = source.model_dump()
+    elif hasattr(source, "dict") and callable(source.dict):
+        data = source.dict()
     # 2. Existing dictionary
-    if isinstance(source, dict):
-        return source
+    elif isinstance(source, dict):
+        data = source
+    else:
+        # 3. File path or raw JSON string
+        source_str = str(source)
+        if os.path.isfile(source_str):
+            try:
+                with open(source_str, encoding="utf-8") as fh:
+                    raw = fh.read()
+                data = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise IRParseError(raw[:200], str(e)) from e
+        else:
+            # Could be a raw JSON string — check if it looks like a file path
+            if source_str.endswith(".json") or os.sep in source_str or "/" in source_str:
+                raise IRFileNotFoundError(source_str)
+            # Try parsing as raw JSON
+            try:
+                data = json.loads(source_str)
+            except json.JSONDecodeError as e:
+                raise IRParseError(source_str, str(e)) from e
 
-    # 3. File path or raw JSON string
-    source_str = str(source)
-    if os.path.isfile(source_str):
-        with open(source_str, encoding="utf-8") as fh:
-            data = json.load(fh)
-            return data if isinstance(data, dict) else {}
-    data = json.loads(source_str)
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        raise MissingFormatHeaderError(payload_preview=type(data).__name__)
+
+    # Validate LAVINCI_CAD_IR_V3 schema format header
+    fmt = data.get("format", "")
+    if not fmt:
+        if strict:
+            raise MissingFormatHeaderError(payload_preview={k: data.get(k) for k in list(data)[:3]})
+        diag.ir_schema_warning(
+            message="IR payload is missing the 'format' header. Expected 'LAVINCI_CAD_IR_V3'.",
+            field="format",
+        )
+    elif fmt != "LAVINCI_CAD_IR_V3":
+        diag.ir_schema_warning(
+            message=f"IR payload declares format '{fmt}' instead of 'LAVINCI_CAD_IR_V3'. Compilation will proceed but some fields may not be recognised.",
+            field="format",
+        )
+
+    return data
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -314,13 +441,27 @@ def _build_layer_table(doc: Drawing, ir: Dict[str, Any], cfg: "ResolvedConfig") 
 
 
 
-def _ensure_layer(doc: Drawing, name: Any, cfg: Optional["ResolvedConfig"] = None) -> str:
+def _ensure_layer(
+    doc: Drawing,
+    name: Any,
+    cfg: Optional["ResolvedConfig"] = None,
+    diag: Optional["CompilationDiagnostics"] = None,
+    strict: bool = False,
+) -> str:
     """Auto-vivify a missing layer with sanitized name so no dangling references crash DXF.
-    Applies cfg.layer_prefix when set."""
+    Applies cfg.layer_prefix when set. Emits a diagnostic or raises in strict mode."""
     clean_name = sanitize_symbol_name(name, fallback="0")
     if cfg and cfg.layer_prefix and clean_name != "0":
         clean_name = cfg.layer_prefix + clean_name
     if clean_name not in doc.layers:
+        if strict:
+            raise StrictModeViolationError(
+                message=f"Layer '{clean_name}' was referenced by an entity but not declared in the IR layers table.",
+                hint=f"Add a layer definition for '{clean_name}' to the 'layers' list in your IR payload.",
+                offender=clean_name,
+            )
+        if diag is not None:
+            diag.layer_auto_created(clean_name)
         doc.layers.new(name=clean_name, dxfattribs={"color": 7})
     return clean_name
 
@@ -360,7 +501,13 @@ def _detect_block_cycles(block_defs: Dict[str, Any]) -> Set[str]:
     return cyclic_nodes
 
 
-def _build_block_definitions(doc: Drawing, ir: Dict[str, Any], cfg: "ResolvedConfig") -> None:
+def _build_block_definitions(
+    doc: Drawing,
+    ir: Dict[str, Any],
+    cfg: "ResolvedConfig",
+    diag: Optional["CompilationDiagnostics"] = None,
+    strict: bool = False,
+) -> None:
     """
     Write every CADBlockDefinition into the DXF BLOCKS table.
     Scans components in the IR to pre-inject ATTDEF entities so that
@@ -369,6 +516,19 @@ def _build_block_definitions(doc: Drawing, ir: Dict[str, Any], cfg: "ResolvedCon
     block_defs = ir.get("block_definitions") or {}
     if not isinstance(block_defs, dict):
         return
+
+    cyclic_nodes = _detect_block_cycles(block_defs)
+    if cyclic_nodes:
+        if strict:
+            raise BlockCycleError(list(cyclic_nodes))
+        elif diag is not None:
+            diag.custom(
+                Severity.WARN,
+                "block_cycle",
+                f"Circular block reference detected involving: {list(cyclic_nodes)}.",
+                suggestion="Remove circular component references within block_definitions.",
+                offender=list(cyclic_nodes),
+            )
 
     # Mine required attribute tags per block from components
     comp_attrib_tags: Dict[str, Set[str]] = {}
@@ -405,7 +565,7 @@ def _build_block_definitions(doc: Drawing, ir: Dict[str, Any], cfg: "ResolvedCon
             blk = doc.blocks.new(name=block_name, base_point=base_pt)
 
         # Write internal primitives into the block
-        _add_primitives_to_layout(blk, block_def, doc, cfg)
+        _add_primitives_to_layout(blk, block_def, doc, cfg, diag, strict)
 
         # Inject ATTDEF definitions so add_auto_blockref creates ATTRIB entities
         needed_tags = comp_attrib_tags.get(block_name, set())
@@ -424,7 +584,13 @@ def _build_block_definitions(doc: Drawing, ir: Dict[str, Any], cfg: "ResolvedCon
 # Stage 6 — Entity Dispatch Across Spaces
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _populate_spaces(doc: Drawing, ir: Dict[str, Any], cfg: "ResolvedConfig") -> None:
+def _populate_spaces(
+    doc: Drawing,
+    ir: Dict[str, Any],
+    cfg: "ResolvedConfig",
+    diag: Optional["CompilationDiagnostics"] = None,
+    strict: bool = False,
+) -> None:
     """Route entities to modelspace or paper space layouts with sanitization.
     Applies layer include/exclude filters and annotation/dimension suppression from cfg."""
     msp = doc.modelspace()
@@ -468,50 +634,56 @@ def _populate_spaces(doc: Drawing, ir: Dict[str, Any], cfg: "ResolvedConfig") ->
     for line in (primitives.get("lines") or []):
         if isinstance(line, dict) and _layer_allowed(line.get("layer")):
             space = get_space(line.get("space"))
-            layer = _ensure_layer(doc, line.get("layer"), cfg)
-            _add_line(space, line, layer, cfg)
+            layer = _ensure_layer(doc, line.get("layer"), cfg, diag, strict)
+            _add_line(space, line, layer, cfg, diag, strict)
 
     for arc in (primitives.get("arcs") or []):
         if isinstance(arc, dict) and _layer_allowed(arc.get("layer")):
             space = get_space(arc.get("space"))
-            layer = _ensure_layer(doc, arc.get("layer"), cfg)
-            _add_arc(space, arc, layer)
+            layer = _ensure_layer(doc, arc.get("layer"), cfg, diag, strict)
+            _add_arc(space, arc, layer, diag, strict)
 
     for circle in (primitives.get("circles") or []):
         if isinstance(circle, dict) and _layer_allowed(circle.get("layer")):
             space = get_space(circle.get("space"))
-            layer = _ensure_layer(doc, circle.get("layer"), cfg)
-            _add_circle(space, circle, layer)
+            layer = _ensure_layer(doc, circle.get("layer"), cfg, diag, strict)
+            _add_circle(space, circle, layer, diag, strict)
 
     for poly in (primitives.get("polylines") or []):
         if isinstance(poly, dict) and _layer_allowed(poly.get("layer")):
             space = get_space(poly.get("space"))
-            layer = _ensure_layer(doc, poly.get("layer"), cfg)
-            _add_polyline(space, poly, layer, doc)
+            layer = _ensure_layer(doc, poly.get("layer"), cfg, diag, strict)
+            _add_polyline(space, poly, layer, doc, diag, strict)
 
     # ── Component Instances (INSERT + ATTRIB) ────────────────────────────────
     block_defs = ir.get("block_definitions") or {}
     for comp in (ir.get("components") or []):
         if isinstance(comp, dict) and _layer_allowed(comp.get("layer")):
             space = get_space(comp.get("space"))
-            layer = _ensure_layer(doc, comp.get("layer"), cfg)
-            _add_insert(space, comp, block_defs, doc, layer, cfg)
+            layer = _ensure_layer(doc, comp.get("layer"), cfg, diag, strict)
+            _add_insert(space, comp, block_defs, doc, layer, cfg, diag, strict)
 
     # ── Annotations (TEXT / MTEXT) ───────────────────────────────────────────
+    all_annots = [a for a in (ir.get("annotations") or []) if isinstance(a, dict)]
     if cfg.include_annotations:
-        for annot in (ir.get("annotations") or []):
-            if isinstance(annot, dict) and _layer_allowed(annot.get("layer")):
+        for annot in all_annots:
+            if _layer_allowed(annot.get("layer")):
                 space = get_space(annot.get("space"))
-                layer = _ensure_layer(doc, annot.get("layer"), cfg)
+                layer = _ensure_layer(doc, annot.get("layer"), cfg, diag, strict)
                 _add_annotation(space, annot, doc, layer)
+    elif all_annots and diag is not None:
+        diag.entity_suppressed_by_preset("TEXT/MTEXT", len(all_annots), cfg.preset_name, "preset disables annotations")
 
     # ── Dimensions ───────────────────────────────────────────────────────────
+    all_dims = [d for d in (ir.get("dimensions") or []) if isinstance(d, dict)]
     if cfg.include_dimensions:
-        for dim in (ir.get("dimensions") or []):
-            if isinstance(dim, dict) and _layer_allowed(dim.get("layer")):
+        for dim in all_dims:
+            if _layer_allowed(dim.get("layer")):
                 space = get_space(dim.get("space"))
-                layer = _ensure_layer(doc, dim.get("layer"), cfg)
+                layer = _ensure_layer(doc, dim.get("layer"), cfg, diag, strict)
                 _add_dimension_as_text(space, dim, layer)
+    elif all_dims and diag is not None:
+        diag.entity_suppressed_by_preset("DIMENSION", len(all_dims), cfg.preset_name, "preset disables dimensions")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -529,30 +701,52 @@ def _apply_color(entity: Any, color: Optional[str]) -> None:
     entity.dxf.true_color = hex_to_truecolor(c)
 
 
-def _add_primitives_to_layout(layout: Any, data: Dict[str, Any], doc: Drawing, cfg: Optional["ResolvedConfig"] = None) -> None:
+def _add_primitives_to_layout(
+    layout: Any,
+    data: Dict[str, Any],
+    doc: Drawing,
+    cfg: Optional["ResolvedConfig"] = None,
+    diag: Optional["CompilationDiagnostics"] = None,
+    strict: bool = False,
+) -> None:
     """Helper to populate internal block definition geometry."""
     for line in (data.get("lines") or []):
         if isinstance(line, dict):
-            layer = _ensure_layer(doc, line.get("layer"), cfg)
-            _add_line(layout, line, layer, cfg)
+            layer = _ensure_layer(doc, line.get("layer"), cfg, diag, strict)
+            _add_line(layout, line, layer, cfg, diag, strict)
     for arc in (data.get("arcs") or []):
         if isinstance(arc, dict):
-            layer = _ensure_layer(doc, arc.get("layer"), cfg)
-            _add_arc(layout, arc, layer)
+            layer = _ensure_layer(doc, arc.get("layer"), cfg, diag, strict)
+            _add_arc(layout, arc, layer, diag, strict)
     for circle in (data.get("circles") or []):
         if isinstance(circle, dict):
-            layer = _ensure_layer(doc, circle.get("layer"), cfg)
-            _add_circle(layout, circle, layer)
+            layer = _ensure_layer(doc, circle.get("layer"), cfg, diag, strict)
+            _add_circle(layout, circle, layer, diag, strict)
     for poly in (data.get("polylines") or []):
         if isinstance(poly, dict):
-            layer = _ensure_layer(doc, poly.get("layer"), cfg)
-            _add_polyline(layout, poly, layer, doc)
+            layer = _ensure_layer(doc, poly.get("layer"), cfg, diag, strict)
+            _add_polyline(layout, poly, layer, doc, diag, strict)
 
 
-def _add_line(layout: Any, line: Dict[str, Any], layer: str, cfg: Optional["ResolvedConfig"] = None) -> None:
+def _add_line(
+    layout: Any,
+    line: Dict[str, Any],
+    layer: str,
+    cfg: Optional["ResolvedConfig"] = None,
+    diag: Optional["CompilationDiagnostics"] = None,
+    strict: bool = False,
+) -> None:
     start = line.get("start")
     end = line.get("end")
     if not validate_line(start, end):
+        if strict:
+            raise StrictModeViolationError(
+                message=f"Degenerate or invalid line on layer '{layer}': start={start}, end={end}",
+                hint="Check line coordinates for non-finite values (NaN, Inf) or zero length.",
+                offender=line,
+            )
+        if diag is not None:
+            diag.entity_dropped_degenerate("LINE", layer, f"invalid or zero-length: start={start}, end={end}")
         return
     # Apply flatten_z: force Z to 0.0 when set in cfg (e.g. cnc_cam, web_lightweight)
     flatten = cfg.flatten_z if cfg else False
@@ -567,13 +761,26 @@ def _add_line(layout: Any, line: Dict[str, Any], layer: str, cfg: Optional["Reso
     _apply_color(e, line.get("color"))
 
 
-
-def _add_arc(layout: Any, arc: Dict[str, Any], layer: str) -> None:
+def _add_arc(
+    layout: Any,
+    arc: Dict[str, Any],
+    layer: str,
+    diag: Optional["CompilationDiagnostics"] = None,
+    strict: bool = False,
+) -> None:
     center = arc.get("center")
     radius = arc.get("radius")
     start_angle = arc.get("start_angle")
     end_angle = arc.get("end_angle")
     if not validate_arc(center, radius, start_angle, end_angle):
+        if strict:
+            raise StrictModeViolationError(
+                message=f"Degenerate or invalid arc on layer '{layer}': center={center}, radius={radius}",
+                hint="Check arc parameters (radius must be > 0 and center/angles must be finite).",
+                offender=arc,
+            )
+        if diag is not None:
+            diag.entity_dropped_degenerate("ARC", layer, f"invalid center={center}, radius={radius}")
         return
     e = layout.add_arc(
         center=(float(center[0]), float(center[1])),
@@ -585,10 +792,24 @@ def _add_arc(layout: Any, arc: Dict[str, Any], layer: str) -> None:
     _apply_color(e, arc.get("color"))
 
 
-def _add_circle(layout: Any, circle: Dict[str, Any], layer: str) -> None:
+def _add_circle(
+    layout: Any,
+    circle: Dict[str, Any],
+    layer: str,
+    diag: Optional["CompilationDiagnostics"] = None,
+    strict: bool = False,
+) -> None:
     center = circle.get("center")
     radius = circle.get("radius")
     if not validate_circle(center, radius):
+        if strict:
+            raise StrictModeViolationError(
+                message=f"Degenerate or invalid circle on layer '{layer}': center={center}, radius={radius}",
+                hint="Check circle parameters (radius must be > 0 and center must be finite).",
+                offender=circle,
+            )
+        if diag is not None:
+            diag.entity_dropped_degenerate("CIRCLE", layer, f"invalid center={center}, radius={radius}")
         return
     e = layout.add_circle(
         center=(float(center[0]), float(center[1])),
@@ -598,9 +819,24 @@ def _add_circle(layout: Any, circle: Dict[str, Any], layer: str) -> None:
     _apply_color(e, circle.get("color"))
 
 
-def _add_polyline(layout: Any, poly: Dict[str, Any], layer: str, doc: Drawing) -> None:
+def _add_polyline(
+    layout: Any,
+    poly: Dict[str, Any],
+    layer: str,
+    doc: Drawing,
+    diag: Optional["CompilationDiagnostics"] = None,
+    strict: bool = False,
+) -> None:
     points = poly.get("points")
     if not validate_polyline(points):
+        if strict:
+            raise StrictModeViolationError(
+                message=f"Degenerate or invalid polyline on layer '{layer}': points={points}",
+                hint="Polylines must have at least 2 valid, finite vertices.",
+                offender=poly,
+            )
+        if diag is not None:
+            diag.entity_dropped_degenerate("POLYLINE", layer, "fewer than 2 valid points")
         return
     pts_2d = [(float(p[0]), float(p[1])) for p in points]
     is_closed = bool(poly.get("is_closed", False))
@@ -628,6 +864,8 @@ def _add_insert(
     doc: Drawing,
     layer: str,
     cfg: Optional["ResolvedConfig"] = None,
+    diag: Optional["CompilationDiagnostics"] = None,
+    strict: bool = False,
 ) -> None:
     raw_block_name = comp.get("block_name")
     if not raw_block_name:
@@ -654,7 +892,7 @@ def _add_insert(
         attribs_data = {}
 
     # Auto-vivify placeholder block if not defined
-    _ensure_block_placeholder(doc, block_name, str(comp.get("resolved_name") or block_name), attribs_data)
+    _ensure_block_placeholder(doc, block_name, str(comp.get("resolved_name") or block_name), attribs_data, diag, strict)
 
     dxfattribs = {
         "layer": layer,
@@ -684,11 +922,26 @@ def _add_insert(
                 pass
 
 
-def _ensure_block_placeholder(doc: Drawing, block_name: str, label: str, attribs_data: Dict[str, Any]) -> None:
+def _ensure_block_placeholder(
+    doc: Drawing,
+    block_name: str,
+    label: str,
+    attribs_data: Dict[str, Any],
+    diag: Optional["CompilationDiagnostics"] = None,
+    strict: bool = False,
+) -> None:
     """Ensure block exists in doc.blocks with crosshair and ATTDEF templates."""
     if block_name in doc.blocks:
         blk = doc.blocks[block_name]
     else:
+        if strict:
+            raise StrictModeViolationError(
+                message=f"Block '{block_name}' was referenced by a component INSERT but not defined in block_definitions.",
+                hint=f"Define '{block_name}' in block_definitions or verify name spelling.",
+                offender=block_name,
+            )
+        if diag is not None:
+            diag.block_auto_vivified(block_name)
         blk = doc.blocks.new(name=block_name, base_point=(0, 0, 0))
         size = 0.5
         blk.add_line((-size, 0), (size, 0), dxfattribs={"layer": "0"})
@@ -713,6 +966,7 @@ def _ensure_block_placeholder(doc: Drawing, block_name: str, label: str, attribs
                 insert=(0.0, 0.0),
                 dxfattribs={"height": 0.2, "invisible": False, "layer": "0"}
             )
+
 
 
 def _add_annotation(layout: Any, annot: Dict[str, Any], doc: Drawing, layer: str) -> None:
@@ -797,7 +1051,12 @@ def _add_dimension_as_text(layout: Any, dim: Dict[str, Any], layer: str) -> None
 # Paper Space Layout Builder (arch_print preset)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _build_paper_space_layout(doc: Drawing, ir: Dict[str, Any], cfg: "ResolvedConfig") -> None:
+def _build_paper_space_layout(
+    doc: Drawing,
+    ir: Dict[str, Any],
+    cfg: "ResolvedConfig",
+    diag: Optional["CompilationDiagnostics"] = None,
+) -> None:
     """
     Provision a PaperSpace layout tab with a printable border and a scaled
     viewport looking into ModelSpace.  Used by the arch_print preset.
@@ -895,3 +1154,7 @@ def _build_paper_space_layout(doc: Drawing, ir: Dict[str, Any], cfg: "ResolvedCo
         )
     except Exception:
         pass  # Viewport provisioning is best-effort
+
+    if diag is not None:
+        diag.paper_space_built(cfg.preset_name, size_key, cfg.orientation, viewport_scale_str)
+

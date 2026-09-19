@@ -20,6 +20,29 @@ from .presets import (
     ResolvedConfig,
     get_preset_config,
 )
+from .exceptions import (
+    CadIrToDxfError,
+    InvalidIRPayloadError,
+    MissingFormatHeaderError,
+    IRFileNotFoundError,
+    IRParseError,
+    InvalidPresetError,
+    InvalidOptionError,
+    InvalidPaperSizeError,
+    InvalidColorModeError,
+    InvalidDxfVersionError,
+    InvalidOrientationError,
+    InvalidViewportScaleError,
+    CompilationError,
+    BlockCycleError,
+    OutputWriteError,
+    StrictModeViolationError,
+)
+from .diagnostics import (
+    CompilationDiagnostics,
+    DiagnosticEntry,
+    Severity,
+)
 
 __all__ = [
     "compile_ir_to_dxf",
@@ -32,5 +55,27 @@ __all__ = [
     "StylingOptions",
     "ResolvedConfig",
     "get_preset_config",
+    # Exceptions
+    "CadIrToDxfError",
+    "InvalidIRPayloadError",
+    "MissingFormatHeaderError",
+    "IRFileNotFoundError",
+    "IRParseError",
+    "InvalidPresetError",
+    "InvalidOptionError",
+    "InvalidPaperSizeError",
+    "InvalidColorModeError",
+    "InvalidDxfVersionError",
+    "InvalidOrientationError",
+    "InvalidViewportScaleError",
+    "CompilationError",
+    "BlockCycleError",
+    "OutputWriteError",
+    "StrictModeViolationError",
+    # Diagnostics
+    "CompilationDiagnostics",
+    "DiagnosticEntry",
+    "Severity",
 ]
-__version__ = "1.1.0"
+__version__ = "1.2.0"
+
