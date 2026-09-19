@@ -1,15 +1,31 @@
 """
-compiler.py — Hardened IR v3 → DXF Compilation Engine.
+compiler.py — Hardened IR v3 → DXF Compilation Engine (with Preset Architecture).
 
 Translates a LAVINCI_CAD_IR_V3 payload (JSON file, dict, or Pydantic model) into a
-fully compliant DXF file (default: DXF R2013 / AC1027).
+fully compliant DXF file driven by a curated preset profile + optional AdvancedOptions.
 
-Hardened against all defect classes discovered in DEFECT_REPORT.md:
-  - Supports Pydantic models & defensive ingestion of null top-level sections
+## Preset Architecture
+    1 IR  ─►  preset (+ optional AdvancedOptions)  ─►  ResolvedConfig  ─►  DXF
+    Relationship: One-to-Many (same IR can produce many preset-flavoured DXFs).
+
+## Available Presets (pass preset= to compile_ir_to_dxf or --preset via CLI)
+    'standard'        Modern DXF R2013, native analytic curves, TrueColor, hierarchical
+                      blocks. Best for AutoCAD, Revit, Rhino, Fusion 360. [DEFAULT]
+    'cnc_cam'         DXF R12, 2D flat (Z=0), blocks exploded to primitives, splines
+                      converted to polylines, no text/dims. For laser/CNC/CAM.
+    'arch_print'      DXF R2013 + auto-provisioned PaperSpace layout tab with scaled
+                      viewport and printable border. For client-ready print sheets.
+    'web_lightweight' DXF R2000, stripped metadata, ACI color, Z-flattened, no dims.
+                      Compact output for web viewers, three.js, GIS, mobile apps.
+    'bim_overlay'     DXF R2018, strict world-coordinate origin, IR_ layer prefix to
+                      prevent BIM layer name collisions. For Revit/Navisworks underlays.
+
+## Hardening
+  - Pydantic model & null-safe defensive ingestion
   - Full layer attribute & visibility retention (linetypes, is_off, is_frozen, is_locked)
-  - True component attribute retention (injects ATTDEF into blocks & ATTRIB into INSERTs)
-  - Symbol name sanitization ([<>/\":;?*|=,'] replaced with underscores)
-  - 3D line coordinate preservation
+  - True component attribute retention (ATTDEF in blocks + ATTRIB on INSERTs)
+  - Symbol name sanitization ([<>/\\\":;?*|=,'] replaced with underscores)
+  - 3D line coordinate preservation (Z=0 flattening only when flatten_z=True in config)
   - Automatic DXF R12 fallback (POLYLINE2D instead of LWPOLYLINE, TEXT instead of MTEXT)
   - Pre-compilation block reference cycle detection
   - Coordinate finiteness validation on extents, inserts, and text
@@ -38,6 +54,8 @@ from .sanitizer import (
     validate_line,
     validate_polyline,
 )
+from .presets import ResolvedConfig, get_preset_config, PresetName, AdvancedOptions, PAPER_SIZES_MM
+from typing import Union as _Union
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Standard AutoCAD linetypes we pre-load so layer references never dangle.
@@ -88,6 +106,8 @@ def compile_ir_to_dxf(
     ir_source: Union[str, Path, Dict[str, Any], Any],
     output_path: Optional[Union[str, Path]] = None,
     dxf_version: str = "R2013",
+    preset: _Union[str, "PresetName"] = "standard",
+    advanced_options: Optional[_Union["AdvancedOptions", Dict[str, Any]]] = None,
 ) -> Drawing:
     """
     Compile a LAVINCI_CAD_IR_V3 payload into a DXF Drawing.
@@ -101,22 +121,46 @@ def compile_ir_to_dxf(
         Optional file path to save the DXF. If None, the Drawing is returned
         in-memory and not written to disk.
     dxf_version:
-        Target DXF version string (e.g. "R2013", "R2000", "R12"). Default: "R2013".
+        DEPRECATED — prefer `preset` instead. When provided alongside `preset`,
+        this overrides the preset's DXF version. Default: "R2013".
+    preset:
+        Named safe preset controlling the full compilation profile.
+        One of: 'standard' (default), 'cnc_cam', 'arch_print',
+        'web_lightweight', 'bim_overlay'.
+    advanced_options:
+        Optional AdvancedOptions dataclass or plain dict of override fields.
+        Only the keys you supply override the preset's baseline defaults.
 
     Returns
     -------
     ezdxf.Drawing
         The compiled, fully populated DXF document.
+
+    Examples
+    --------
+    >>> doc = compile_ir_to_dxf("plan.json", preset="standard")
+    >>> doc = compile_ir_to_dxf("plan.json", preset="cnc_cam")
+    >>> doc = compile_ir_to_dxf("plan.json", preset="arch_print",
+    ...     advanced_options={"layout": {"paper_size": "ISO_A1"}})
     """
+    cfg = get_preset_config(preset, advanced_options)
+
+    # Allow dxf_version kwarg to override the preset version (backward compat)
+    if dxf_version != "R2013":
+        cfg.dxf_version = dxf_version
+
     ir = _load_ir(ir_source)
 
-    doc = ezdxf.new(dxf_version, setup=True)
+    doc = ezdxf.new(cfg.dxf_version, setup=True)
 
-    _configure_header(doc, ir)
+    _configure_header(doc, ir, cfg)
     _load_linetypes(doc)
-    _build_layer_table(doc, ir)
-    _build_block_definitions(doc, ir)
-    _populate_spaces(doc, ir)
+    _build_layer_table(doc, ir, cfg)
+    _build_block_definitions(doc, ir, cfg)
+    _populate_spaces(doc, ir, cfg)
+
+    if cfg.create_paper_space:
+        _build_paper_space_layout(doc, ir, cfg)
 
     if output_path is not None:
         doc.saveas(str(output_path))
@@ -154,7 +198,7 @@ def _load_ir(source: Union[str, Path, Dict[str, Any], Any]) -> Dict[str, Any]:
 # Stage 2 — DXF Header
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _configure_header(doc: Drawing, ir: Dict[str, Any]) -> None:
+def _configure_header(doc: Drawing, ir: Dict[str, Any], cfg: "ResolvedConfig") -> None:
     """Set $INSUNITS, $MEASUREMENT, and spatial extents from IR metadata."""
     meta = ir.get("metadata") or {}
     extents = ir.get("extents") or {}
@@ -181,6 +225,7 @@ def _configure_header(doc: Drawing, ir: Dict[str, Any]) -> None:
             doc.header["$EXTMAX"] = (float(mx[0]), float(mx[1]), 0.0)
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Stage 3 — Linetype Table
 # ──────────────────────────────────────────────────────────────────────────────
@@ -200,11 +245,13 @@ def _load_linetypes(doc: Drawing) -> None:
 # Stage 4 — Layer Table (with full flag & linetype retention)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _build_layer_table(doc: Drawing, ir: Dict[str, Any]) -> None:
+def _build_layer_table(doc: Drawing, ir: Dict[str, Any], cfg: "ResolvedConfig") -> None:
     """
     Register every layer from the IR into the DXF TABLES section.
     Preserves linetypes, colors (including negative color for layer off),
     and frozen / locked flags.
+    Applies cfg.layer_prefix to all layer names.
+    In monochrome mode, all layer colors are set to ACI 7 (black/white).
     """
     layers = ir.get("layers") or []
     for layer_def in layers:
@@ -214,9 +261,17 @@ def _build_layer_table(doc: Drawing, ir: Dict[str, Any]) -> None:
         raw_name = layer_def.get("name", "0")
         name = sanitize_symbol_name(raw_name, fallback="0")
 
+        # Apply layer_prefix from config (e.g. 'IR_' for BIM overlay)
+        if cfg.layer_prefix and name != "0":
+            name = cfg.layer_prefix + name
+
         try:
             aci = int(layer_def.get("color_aci", 7))
         except (ValueError, TypeError):
+            aci = 7
+
+        # monochrome mode: force all layers to ACI 7 (white/black)
+        if cfg.color_mode == "monochrome":
             aci = 7
 
         linetype = str(layer_def.get("linetype") or "Continuous").strip()
@@ -258,12 +313,17 @@ def _build_layer_table(doc: Drawing, ir: Dict[str, Any]) -> None:
             doc.layers.new(name=name, dxfattribs=dxfattribs)
 
 
-def _ensure_layer(doc: Drawing, name: Any) -> str:
-    """Auto-vivify a missing layer with sanitized name so no dangling references crash DXF."""
+
+def _ensure_layer(doc: Drawing, name: Any, cfg: Optional["ResolvedConfig"] = None) -> str:
+    """Auto-vivify a missing layer with sanitized name so no dangling references crash DXF.
+    Applies cfg.layer_prefix when set."""
     clean_name = sanitize_symbol_name(name, fallback="0")
+    if cfg and cfg.layer_prefix and clean_name != "0":
+        clean_name = cfg.layer_prefix + clean_name
     if clean_name not in doc.layers:
         doc.layers.new(name=clean_name, dxfattribs={"color": 7})
     return clean_name
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -300,7 +360,7 @@ def _detect_block_cycles(block_defs: Dict[str, Any]) -> Set[str]:
     return cyclic_nodes
 
 
-def _build_block_definitions(doc: Drawing, ir: Dict[str, Any]) -> None:
+def _build_block_definitions(doc: Drawing, ir: Dict[str, Any], cfg: "ResolvedConfig") -> None:
     """
     Write every CADBlockDefinition into the DXF BLOCKS table.
     Scans components in the IR to pre-inject ATTDEF entities so that
@@ -345,7 +405,7 @@ def _build_block_definitions(doc: Drawing, ir: Dict[str, Any]) -> None:
             blk = doc.blocks.new(name=block_name, base_point=base_pt)
 
         # Write internal primitives into the block
-        _add_primitives_to_layout(blk, block_def, doc)
+        _add_primitives_to_layout(blk, block_def, doc, cfg)
 
         # Inject ATTDEF definitions so add_auto_blockref creates ATTRIB entities
         needed_tags = comp_attrib_tags.get(block_name, set())
@@ -359,13 +419,36 @@ def _build_block_definitions(doc: Drawing, ir: Dict[str, Any]) -> None:
                 )
 
 
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Stage 6 — Entity Dispatch Across Spaces
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _populate_spaces(doc: Drawing, ir: Dict[str, Any]) -> None:
-    """Route entities to modelspace or paper space layouts with sanitization."""
+def _populate_spaces(doc: Drawing, ir: Dict[str, Any], cfg: "ResolvedConfig") -> None:
+    """Route entities to modelspace or paper space layouts with sanitization.
+    Applies layer include/exclude filters and annotation/dimension suppression from cfg."""
     msp = doc.modelspace()
+
+    # Build layer filter sets from cfg
+    include_set = set(cfg.include_layers) if cfg.include_layers else None
+    exclude_set = set(cfg.exclude_layers) if cfg.exclude_layers else set()
+
+    def _layer_allowed(raw_layer: Any) -> bool:
+        """Return True if this layer passes include/exclude filter rules."""
+        lname = sanitize_symbol_name(raw_layer, fallback="0")
+        if cfg.layer_prefix and lname != "0":
+            lname = cfg.layer_prefix + lname
+        # Exclude filter with simple '*' suffix wildcard support
+        for pat in exclude_set:
+            if pat.endswith("*"):
+                if lname.startswith(pat[:-1]) or lname.upper().startswith(pat[:-1].upper()):
+                    return False
+            elif lname == pat or lname.upper() == pat.upper():
+                return False
+        # Include filter: if set, only explicitly listed layers allowed
+        if include_set is not None:
+            return (lname in include_set or lname.upper() in {s.upper() for s in include_set})
+        return True
 
     def get_space(space_name: Any):
         if not space_name or str(space_name).strip() in ("Model", "model"):
@@ -383,50 +466,52 @@ def _populate_spaces(doc: Drawing, ir: Dict[str, Any]) -> None:
     primitives = geom.get("primitives") or {} if isinstance(geom, dict) else {}
 
     for line in (primitives.get("lines") or []):
-        if isinstance(line, dict):
+        if isinstance(line, dict) and _layer_allowed(line.get("layer")):
             space = get_space(line.get("space"))
-            layer = _ensure_layer(doc, line.get("layer"))
-            _add_line(space, line, layer)
+            layer = _ensure_layer(doc, line.get("layer"), cfg)
+            _add_line(space, line, layer, cfg)
 
     for arc in (primitives.get("arcs") or []):
-        if isinstance(arc, dict):
+        if isinstance(arc, dict) and _layer_allowed(arc.get("layer")):
             space = get_space(arc.get("space"))
-            layer = _ensure_layer(doc, arc.get("layer"))
+            layer = _ensure_layer(doc, arc.get("layer"), cfg)
             _add_arc(space, arc, layer)
 
     for circle in (primitives.get("circles") or []):
-        if isinstance(circle, dict):
+        if isinstance(circle, dict) and _layer_allowed(circle.get("layer")):
             space = get_space(circle.get("space"))
-            layer = _ensure_layer(doc, circle.get("layer"))
+            layer = _ensure_layer(doc, circle.get("layer"), cfg)
             _add_circle(space, circle, layer)
 
     for poly in (primitives.get("polylines") or []):
-        if isinstance(poly, dict):
+        if isinstance(poly, dict) and _layer_allowed(poly.get("layer")):
             space = get_space(poly.get("space"))
-            layer = _ensure_layer(doc, poly.get("layer"))
+            layer = _ensure_layer(doc, poly.get("layer"), cfg)
             _add_polyline(space, poly, layer, doc)
 
     # ── Component Instances (INSERT + ATTRIB) ────────────────────────────────
     block_defs = ir.get("block_definitions") or {}
     for comp in (ir.get("components") or []):
-        if isinstance(comp, dict):
+        if isinstance(comp, dict) and _layer_allowed(comp.get("layer")):
             space = get_space(comp.get("space"))
-            layer = _ensure_layer(doc, comp.get("layer"))
-            _add_insert(space, comp, block_defs, doc, layer)
+            layer = _ensure_layer(doc, comp.get("layer"), cfg)
+            _add_insert(space, comp, block_defs, doc, layer, cfg)
 
     # ── Annotations (TEXT / MTEXT) ───────────────────────────────────────────
-    for annot in (ir.get("annotations") or []):
-        if isinstance(annot, dict):
-            space = get_space(annot.get("space"))
-            layer = _ensure_layer(doc, annot.get("layer"))
-            _add_annotation(space, annot, doc, layer)
+    if cfg.include_annotations:
+        for annot in (ir.get("annotations") or []):
+            if isinstance(annot, dict) and _layer_allowed(annot.get("layer")):
+                space = get_space(annot.get("space"))
+                layer = _ensure_layer(doc, annot.get("layer"), cfg)
+                _add_annotation(space, annot, doc, layer)
 
     # ── Dimensions ───────────────────────────────────────────────────────────
-    for dim in (ir.get("dimensions") or []):
-        if isinstance(dim, dict):
-            space = get_space(dim.get("space"))
-            layer = _ensure_layer(doc, dim.get("layer"))
-            _add_dimension_as_text(space, dim, layer)
+    if cfg.include_dimensions:
+        for dim in (ir.get("dimensions") or []):
+            if isinstance(dim, dict) and _layer_allowed(dim.get("layer")):
+                space = get_space(dim.get("space"))
+                layer = _ensure_layer(doc, dim.get("layer"), cfg)
+                _add_dimension_as_text(space, dim, layer)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -444,33 +529,35 @@ def _apply_color(entity: Any, color: Optional[str]) -> None:
     entity.dxf.true_color = hex_to_truecolor(c)
 
 
-def _add_primitives_to_layout(layout: Any, data: Dict[str, Any], doc: Drawing) -> None:
+def _add_primitives_to_layout(layout: Any, data: Dict[str, Any], doc: Drawing, cfg: Optional["ResolvedConfig"] = None) -> None:
     """Helper to populate internal block definition geometry."""
     for line in (data.get("lines") or []):
         if isinstance(line, dict):
-            layer = _ensure_layer(doc, line.get("layer"))
-            _add_line(layout, line, layer)
+            layer = _ensure_layer(doc, line.get("layer"), cfg)
+            _add_line(layout, line, layer, cfg)
     for arc in (data.get("arcs") or []):
         if isinstance(arc, dict):
-            layer = _ensure_layer(doc, arc.get("layer"))
+            layer = _ensure_layer(doc, arc.get("layer"), cfg)
             _add_arc(layout, arc, layer)
     for circle in (data.get("circles") or []):
         if isinstance(circle, dict):
-            layer = _ensure_layer(doc, circle.get("layer"))
+            layer = _ensure_layer(doc, circle.get("layer"), cfg)
             _add_circle(layout, circle, layer)
     for poly in (data.get("polylines") or []):
         if isinstance(poly, dict):
-            layer = _ensure_layer(doc, poly.get("layer"))
+            layer = _ensure_layer(doc, poly.get("layer"), cfg)
             _add_polyline(layout, poly, layer, doc)
 
 
-def _add_line(layout: Any, line: Dict[str, Any], layer: str) -> None:
+def _add_line(layout: Any, line: Dict[str, Any], layer: str, cfg: Optional["ResolvedConfig"] = None) -> None:
     start = line.get("start")
     end = line.get("end")
     if not validate_line(start, end):
         return
-    z1 = float(start[2]) if len(start) > 2 and is_numeric_and_finite(start[2]) else 0.0
-    z2 = float(end[2]) if len(end) > 2 and is_numeric_and_finite(end[2]) else 0.0
+    # Apply flatten_z: force Z to 0.0 when set in cfg (e.g. cnc_cam, web_lightweight)
+    flatten = cfg.flatten_z if cfg else False
+    z1 = 0.0 if flatten else (float(start[2]) if len(start) > 2 and is_numeric_and_finite(start[2]) else 0.0)
+    z2 = 0.0 if flatten else (float(end[2]) if len(end) > 2 and is_numeric_and_finite(end[2]) else 0.0)
 
     e = layout.add_line(
         start=(float(start[0]), float(start[1]), z1),
@@ -478,6 +565,7 @@ def _add_line(layout: Any, line: Dict[str, Any], layer: str) -> None:
         dxfattribs={"layer": layer},
     )
     _apply_color(e, line.get("color"))
+
 
 
 def _add_arc(layout: Any, arc: Dict[str, Any], layer: str) -> None:
@@ -539,6 +627,7 @@ def _add_insert(
     block_defs: Dict[str, Any],
     doc: Drawing,
     layer: str,
+    cfg: Optional["ResolvedConfig"] = None,
 ) -> None:
     raw_block_name = comp.get("block_name")
     if not raw_block_name:
@@ -548,7 +637,8 @@ def _add_insert(
     pos = comp.get("position") or [0.0, 0.0, 0.0]
     if (isinstance(pos, (list, tuple)) and len(pos) >= 2 and
             is_numeric_and_finite(pos[0], pos[1])):
-        z = float(pos[2]) if len(pos) > 2 and is_numeric_and_finite(pos[2]) else 0.0
+        flatten = cfg.flatten_z if cfg else False
+        z = 0.0 if flatten else (float(pos[2]) if len(pos) > 2 and is_numeric_and_finite(pos[2]) else 0.0)
         insert_pt = (float(pos[0]), float(pos[1]), z)
     else:
         insert_pt = (0.0, 0.0, 0.0)
@@ -669,10 +759,11 @@ def _add_annotation(layout: Any, annot: Dict[str, Any], doc: Drawing, layer: str
 
 
 def _add_dimension_as_text(layout: Any, dim: Dict[str, Any], layer: str) -> None:
-    defpoint = dim.get("defpoint") or [0.0, 0.0]
-    if (isinstance(defpoint, (list, tuple)) and len(defpoint) >= 2 and
-            is_numeric_and_finite(defpoint[0], defpoint[1])):
-        insert = (float(defpoint[0]), float(defpoint[1]))
+    # Prefer explicitly positioned text midpoint anchor if available
+    pos = dim.get("text_midpoint") or dim.get("defpoint") or [0.0, 0.0]
+    if (isinstance(pos, (list, tuple)) and len(pos) >= 2 and
+            is_numeric_and_finite(pos[0], pos[1])):
+        insert = (float(pos[0]), float(pos[1]))
     else:
         insert = (0.0, 0.0)
 
@@ -686,11 +777,121 @@ def _add_dimension_as_text(layout: Any, dim: Dict[str, Any], layer: str) -> None
     else:
         return
 
-    layout.add_mtext(
-        label,
-        dxfattribs={
-            "layer": layer,
-            "char_height": 0.15,
-            "insert": insert,
-        },
-    )
+    raw_h = dim.get("text_height")
+    char_h = float(raw_h) if (is_numeric_and_finite(raw_h) and float(raw_h) > 0.0) else 0.15
+
+    attribs = {
+        "layer": layer,
+        "char_height": char_h,
+        "insert": insert,
+    }
+
+    raw_rot = dim.get("text_rotation")
+    if is_numeric_and_finite(raw_rot):
+        attribs["rotation"] = float(raw_rot)
+
+    layout.add_mtext(label, dxfattribs=attribs)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Paper Space Layout Builder (arch_print preset)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_paper_space_layout(doc: Drawing, ir: Dict[str, Any], cfg: "ResolvedConfig") -> None:
+    """
+    Provision a PaperSpace layout tab with a printable border and a scaled
+    viewport looking into ModelSpace.  Used by the arch_print preset.
+    """
+    from .presets import PAPER_SIZES_MM
+    import math as _math
+
+    # Resolve sheet dimensions in mm
+    size_key = (cfg.paper_size or "ISO_A3").upper()
+    if size_key not in PAPER_SIZES_MM:
+        size_key = "ISO_A3"
+    w_mm, h_mm = PAPER_SIZES_MM[size_key]
+
+    # Swap for portrait
+    if (cfg.orientation or "landscape").lower() == "portrait":
+        w_mm, h_mm = h_mm, w_mm
+
+    margin = float(cfg.margin_mm or 10.0)
+
+    # Create (or reuse) Paper Space layout
+    layout_name = "Presentation_Sheet"
+    if layout_name not in doc.layouts:
+        try:
+            layout = doc.layouts.new(layout_name)
+        except Exception:
+            return
+    else:
+        layout = doc.layouts.get(layout_name)
+
+    # Configure the layout's page setup (units in mm = 1, landscape/portrait)
+    try:
+        layout.page_setup(
+            size=(w_mm, h_mm),
+            margins=(margin, margin, margin, margin),
+            units="mm",
+        )
+    except Exception:
+        pass  # page_setup may not be available in older ezdxf versions
+
+    # Draw border rectangle (paper extents minus margins)
+    border_pts = [
+        (margin, margin),
+        (w_mm - margin, margin),
+        (w_mm - margin, h_mm - margin),
+        (margin, h_mm - margin),
+        (margin, margin),
+    ]
+    layout.add_lwpolyline(border_pts, dxfattribs={"layer": "0", "lineweight": 50})
+
+    # Compute model-space extents
+    extents = ir.get("extents") or {}
+    mn = extents.get("min") or [0.0, 0.0]
+    mx = extents.get("max") or [0.0, 0.0]
+    try:
+        model_w = float(mx[0]) - float(mn[0])
+        model_h = float(mx[1]) - float(mn[1])
+        model_cx = (float(mn[0]) + float(mx[0])) / 2.0
+        model_cy = (float(mn[1]) + float(mx[1])) / 2.0
+    except Exception:
+        model_w, model_h = 1000.0, 1000.0
+        model_cx, model_cy = 500.0, 500.0
+
+    if model_w <= 0 or model_h <= 0:
+        model_w, model_h = 1000.0, 1000.0
+        model_cx, model_cy = 500.0, 500.0
+
+    # Determine viewport scale: auto-fit or user-specified ratio
+    vp_w = w_mm - 2 * margin
+    vp_h = h_mm - 2 * margin
+    viewport_scale_str = cfg.viewport_scale or "auto"
+
+    if viewport_scale_str == "auto" or not viewport_scale_str:
+        # Fit model into viewport; scale = paper_size / model_size
+        scale = min(vp_w / model_w, vp_h / model_h)
+    else:
+        # Parse "1:50" → 1/50, "1:100" → 1/100
+        try:
+            parts = viewport_scale_str.split(":")
+            scale = float(parts[0]) / float(parts[1]) if len(parts) == 2 else float(parts[0])
+        except Exception:
+            scale = min(vp_w / model_w, vp_h / model_h)
+
+    # Add viewport centred on the sheet interior
+    vp_cx = w_mm / 2.0
+    vp_cy = h_mm / 2.0
+    vp_width = min(vp_w, model_w * scale)
+    vp_height = min(vp_h, model_h * scale)
+
+    try:
+        layout.add_viewport(
+            center=(vp_cx, vp_cy, 0),
+            size=(vp_width, vp_height),
+            view_center_point=(model_cx, model_cy, 0),
+            view_height=model_h,
+        )
+    except Exception:
+        pass  # Viewport provisioning is best-effort
