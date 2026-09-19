@@ -388,6 +388,40 @@ class TestBoundaryConditions(unittest.TestCase):
         self.assertEqual(len(inserts), 1)
         self.assertEqual(inserts[0].dxf.name, "MYSTERY_BLOCK")
 
+    def test_dimension_text_metadata_placement(self):
+        """Verify dimension text_midpoint, text_height, and text_rotation are respected."""
+        ir = {
+            "format": "LAVINCI_CAD_IR_V3",
+            "metadata": {"source_file": "dims.dwg"},
+            "layers": [{"name": "DIM_LAYER", "color_aci": 3, "hex_color": "#00ff00"}],
+            "geometry_primitives": {"primitives": {"lines": []}},
+            "dimensions": [
+                {
+                    "type": "DIMENSION",
+                    "layer": "DIM_LAYER",
+                    "space": "Model",
+                    "measurement": 2640.0,
+                    "text": "2640",
+                    "defpoint": [4937.8, 3445.1],
+                    "defpoint2": [2297.8, 3704.1],
+                    "text_midpoint": [3617.8, 3557.6],
+                    "text_height": 125.0,
+                    "text_rotation": 45.0,
+                }
+            ],
+        }
+        doc = compile_ir_to_dxf(ir)
+        msp = doc.modelspace()
+        mtexts = [e for e in msp if e.dxftype() == "MTEXT"]
+        self.assertEqual(len(mtexts), 1)
+        m = mtexts[0]
+        self.assertEqual(m.text, "2640")
+        self.assertAlmostEqual(m.dxf.insert.x, 3617.8, places=1)
+        self.assertAlmostEqual(m.dxf.insert.y, 3557.6, places=1)
+        self.assertAlmostEqual(m.dxf.char_height, 125.0, places=1)
+        self.assertAlmostEqual(m.dxf.rotation, 45.0, places=1)
+
 
 if __name__ == "__main__":
     unittest.main()
+
