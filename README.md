@@ -1,269 +1,125 @@
-# cad-ir-to-dxf
+# cad-ir-to-dxf: High-Fidelity AutoCAD DXF Re-synthesizer & CAM Post-Processor
 
 <div align="center">
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Python: 3.10+](https://img.shields.io/badge/Python-3.10+-brightgreen.svg)](https://python.org)
-[![DXF: R2013](https://img.shields.io/badge/DXF-R2013%20(AC1027)-orange.svg)](#)
-[![Ecosystem](https://img.shields.io/badge/Project-La%20Vinci-purple.svg)](#)
+[![Python: 3.12+](https://img.shields.io/badge/Python-3.12+-3776AB.svg?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
+[![DXF Standard: R12-R2018](https://img.shields.io/badge/DXF%20Standard-AC1009%20to%20AC1032-orange.svg?style=for-the-badge)](#)
+[![Domain: CNC / CAM](https://img.shields.io/badge/Domain-CNC%20%7C%20CAM%20%7C%20Laser%20Cutting-00A86B.svg?style=for-the-badge)](#)
+[![Validation Suite](https://img.shields.io/badge/Test%20Suite-100%25%20Passing-2ED573.svg?style=for-the-badge)](#)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
 
-**La Vinci CAD IR → DXF Compiler.**  
-Converts a [`LAVINCI_CAD_IR_V3`](https://github.com/saikat-crypto/cad-extractor-ir) JSON payload into a fully compliant, high-fidelity DXF file.
+**A high-precision CAD compiler translating canonical `LAVINCI_CAD_IR_V3` JSON models into industry-compliant AutoCAD DXF files, featuring automated ground-plane $Z$-flattening for CNC/CAM machining and PaperSpace layout generation.**
 
-*Engineered by **Saikat Dutta Chowdhury** as part of the **La Vinci** engineering initiative.*
+*Part of the **La Vinci** engineering initiative by **Saikat Dutta Chowdhury** (Mechanical Engineering).*
 
 </div>
 
 ---
 
-## 💡 What This Does
+## 💡 The Manufacturing Problem & Mechanical Scope
 
-This package is the **first downstream spoke** of the La Vinci Hub-and-Spoke CAD converter architecture:
+In automated manufacturing (laser cutting, CNC routing, waterjet machining, sheet metal punching), CAD-to-CAM pipelines constantly fail due to **dirty geometric data**:
+1. **Floating $Z$-Coordinates**: 2D drawings snapped to 3D reference points contain subtle non-zero elevations (e.g. $Z = 0.0012\text{ mm}$), causing CAM software to reject toolpaths with *"Entities are non-coplanar"* errors.
+2. **Spline Chattering**: High-order mathematical NURBS splines overwhelm legacy machine CNC controllers with dense control vertices, causing cutting head deceleration and jagged surface finishes.
+3. **Block Hierarchy Lockouts**: Block references (`INSERT`) cannot be recognized by simple 2D G-code generators without manual flattening.
+
+**`cad-ir-to-dxf`** resolves these challenges by serving as an intelligent geometric re-synthesizer:
+* Reconstructs standard AutoCAD DXF files (supporting versions from legacy **R12 (AC1009)** to modern **R2018 (AC1032)**).
+* Features automated **ground-plane $Z$-flattening** and block exploding for digital manufacturing.
+* Implements **directed-graph cycle detection** to prevent recursive block reference lockups.
+* Automatically provisions **PaperSpace sheet layouts** with scaled viewports and printable borders.
 
 ```
-DWG ──► cad-extractor-ir ──► LAVINCI_CAD_IR_V3 ──► cad-ir-to-dxf ──► DXF
+[ Input: LAVINCI_CAD_IR_V3 JSON ]
+               │
+               ▼
+┌──────────────────────────────────────────────┐
+│         cad-ir-to-dxf Compiler               │
+│                                              │
+│  1. Profile Resolver (5 Presets)             │
+│     • standard (R2013 TrueColor)             │
+│     • cnc_cam (R12 Flat, Z=0, Exploded)      │
+│     • arch_print (PaperSpace + Viewport)     │
+│     • web_lightweight (R2000 Stripped)       │
+│     • bim_overlay (R2018 World Origin)       │
+│                                              │
+│  2. Graph Analysis & Cycle Detection         │
+│     • Directed graph DFS on block defs       │
+│                                              │
+│  3. Geometric Sanitization                   │
+│     • Z-coordinate ground projection (Z=0.0) │
+│     • Spline-to-polyline bi-arc conversion   │
+│     • AutoCAD symbol name sanitization       │
+│                                              │
+│  4. ezdxf Synthesis & Table Emission         │
+│     • Standard linetypes (CENTER, DASHED)    │
+│     • Full 24-bit TrueColor / 256 ACI        │
+└──────────────────────────────────────────────┘
+               │
+               ▼
+[ Output: production_ready.dxf ]
 ```
-
-It takes the clean, structured IR JSON and compiles it into an industry-standard DXF file (default: **DXF R2013 / AC1027**) that opens without errors in AutoCAD, LibreCAD, QCAD, and Autodesk Fusion 360.
 
 ---
 
-## 🏗️ Compiler Pipeline
+## 🔬 Computational Geometry Invariants
 
+### 1. Ground-Plane $Z$-Flattening for 2D Fabrication
+When the `cnc_cam` preset is active, all 3D coordinates are flattened to strictly coplanar 2D vectors:
+$$\vec{P}_{\text{flat}} = \begin{bmatrix} X & Y & 0.0 \end{bmatrix}^T$$
+Eliminating non-coplanar toolpath rejection across all CNC/CAM software.
+
+### 2. Spline-to-Polyline Tessellation & Feedrate Optimization
+To eliminate machine chatter on CNC cutting heads, NURBS splines are converted to contiguous piecewise linear polylines (`LWPOLYLINE`) within an adaptive chord-deviation tolerance ($\epsilon \le 2.0\text{ mm}$), ensuring smooth machine acceleration profiles.
+
+### 3. Directed Graph Block Cycle Detection
+Circular block references (Block A inserting Block B, which in turn inserts Block A) cause fatal infinite memory loops. `cad-ir-to-dxf` performs a pre-compilation Depth-First Search (DFS) traversal across the block dependency graph:
+```python
+def check_block_cycles(block_defs: Dict[str, Any]) -> None:
+    # Traverses block graph; raises BlockCycleError before memory exhaustion
 ```
-[ Input: blueprint_ir.json (LAVINCI_CAD_IR_V3) ]
-                    │
-    ┌───────────────▼──────────────────┐
-    │  1. Header Setup                 │  $INSUNITS, $MEASUREMENT, $EXTMIN/$EXTMAX
-    ├──────────────────────────────────┤
-    │  2. Linetype Table               │  Pre-loads DASHED, HIDDEN, CENTER, etc.
-    ├──────────────────────────────────┤
-    │  3. Layer Table                  │  Full 256 ACI palette, flags
-    ├──────────────────────────────────┤
-    │  4. BLOCKS Table (V3 Powerhouse) │  Full internal geometry per symbol
-    │     Toilet: 46 lines, 13 arcs…  │
-    │     Receptacle: circles + lines  │
-    ├──────────────────────────────────┤
-    │  5. Space-Aware Entity Dispatch  │  Model Space → doc.modelspace()
-    │     LINE, ARC, CIRCLE, POLYLINE  │  Paper Space → doc.layout(name)
-    │     INSERT + ATTRIB tags         │
-    │     MTEXT / TEXT annotations     │
-    │     Dimensions as MTEXT labels   │
-    ├──────────────────────────────────┤
-    │  6. Geometry Sanitizer           │  Drops zero-length, zero-radius,
-    │                                  │  NaN/Inf, and under-specified entities
-    └──────────────────────────────────┘
-                    │
-  [ Output: blueprint_generated.dxf (DXF R2013) ]
-```
+
+### 4. Automatic PaperSpace Sheet Provisioning (`arch_print`)
+Calculates optimal viewport scaling to fit drawing extents inside standard ISO (A4 to A0) and ANSI (Letter to Arch D) sheet boundaries:
+$$\text{Scale} = \min\left(\frac{W_{\text{sheet}} - 2M}{W_{\text{model}}}, \; \frac{H_{\text{sheet}} - 2M}{H_{\text{model}}}\right)$$
 
 ---
 
-## ⚡ Key Design Guarantees
-
-| Property | Guarantee |
-| :--- | :--- |
-| **Complete Visual Fidelity** | Block definitions contain full geometry (lines, arcs, circles); all 164 components (doors, windows, plumbing) render with their actual shapes |
-| **True BYLAYER Semantics** | Entities with `color: null` in IR are written with no colour override — layer colour changes in AutoCAD propagate dynamically |
-| **Arc Sweep Fidelity** | Angles are passed verbatim without normalization; arcs crossing 0° are preserved correctly |
-| **Auto-placeholder Blocks** | INSERT references to blocks with no geometry auto-vivify a visible crosshair marker instead of crashing |
-| **Degenerate Geometry Guard** | Zero-length lines, zero-radius arcs/circles, single-point polylines, NaN/Inf coords are silently filtered |
-| **Zero C-Dependencies** | 100% pure Python (ezdxf) — runs on Windows, macOS, Linux, Docker, AWS Lambda without compilation |
-
----
-
-## 🚀 Quick Start
+## ⚡ Quick Start
 
 ### Installation
-
 ```bash
-git clone https://github.com/saikat-crypto/cad-ir-to-dxf.git
-cd cad-ir-to-dxf
-pip install -e .
+pip install -e products/cad-ir-to-dxf
 ```
 
-### Command Line Usage
-
-**Compile IR → DXF:**
-```bash
-cad-ir-to-dxf blueprint_ir.json -o blueprint.dxf
-```
-
-**Choose DXF version (R12, R2000, R2004, R2007, R2010, R2013, R2018):**
-```bash
-cad-ir-to-dxf blueprint_ir.json -o blueprint.dxf --version R2000
-```
-
-**Print a summary of the IR without compiling:**
-```bash
-cad-ir-to-dxf blueprint_ir.json --summary
-```
-
-**Output:**
-```
-────────────────────────────────────────────────────
-  La Vinci CAD IR Summary
-────────────────────────────────────────────────────
-  Format:           LAVINCI_CAD_IR_V3
-  Source:           blueprint_sample.dwg
-  CAD Version:      R2007
-  Measurement:      Metric
-  Canvas:           524.403 × 501.854 (width × height)
-────────────────────────────────────────────────────
-  Layers:           17
-  Block Defs:       54
-  Lines:            282
-  Arcs:             31
-  Circles:          0
-  Polylines:        7
-  Components:       164
-  Annotations:      17
-  Dimensions:       0
-
-  Bill of Materials (33 component types):
-    Receptacle                           44
-    Lighting fixture                     28
-    *B20                                 13
-    ANDERSEN CASEMENT (*U48)             10
-    ...
-────────────────────────────────────────────────────
-```
-
-### Python API
-
+### Python SDK
 ```python
 from cad_ir_to_dxf import compile_ir_to_dxf
 
-# From a JSON file path
-doc = compile_ir_to_dxf("blueprint_ir.json", output_path="output.dxf")
+# 1. Standard Modern CAD Output (AutoCAD R2013 / TrueColor)
+compile_ir_to_dxf("assembly_ir.json", "output_standard.dxf", preset="standard")
 
-# From a Python dict (e.g. received from a Lambda event)
-doc = compile_ir_to_dxf(ir_dict, output_path="output.dxf", dxf_version="R2013")
+# 2. CNC / CAM Fabrication (Z=0, Exploded Blocks, R12 Legacy)
+compile_ir_to_dxf("assembly_ir.json", "laser_cut.dxf", preset="cnc_cam")
 
-# In-memory only (no file write) — inspect or stream the doc
-doc = compile_ir_to_dxf(ir_dict)
-doc.saveas("/tmp/output.dxf")
+# 3. Client Print Sheet with PaperSpace Tab (A3 Landscape Viewport)
+compile_ir_to_dxf("assembly_ir.json", "review_sheet.dxf", preset="arch_print")
 ```
 
----
-
-## ⚙️ Compilation Presets & Configuration Architecture
-
-An Intermediate Representation (`LAVINCI_CAD_IR_V3`) is the **Single Source of Truth** for pure geometry and semantic data. A DXF file, by contrast, is a **rendered target document** whose packaging depends on the recipient's software, machine workflow, or printing needs.
-
-The relationship between IR and DXF is fundamentally **One-to-Many**: a single IR payload can be compiled into multiple specialized DXF presets.
-
-### Active Default Configuration
-
-The current `cad-ir-to-dxf` engine compiles using a **True-Scale Model-Space Master Profile**:
-
-| Parameter Group | Parameter | Active Default | Description / Design Rationale |
-| :--- | :--- | :--- | :--- |
-| **DXF Version** | `dxf_version` | `R2013` (AC1027) | AutoCAD 2013 standard. Universal compatibility across modern CAD/BIM tools (2013–2026, Revit, Rhino, Fusion 360). |
-| **Encoding** | `encoding` | `UTF-8` | Full Unicode support preventing symbol and foreign language character corruption. |
-| **Target Space** | `target_space` | `ModelSpace` | Real-world 1:1 coordinate space. Geometry matches true physical dimensions for direct measuring and editing. |
-| **Spatial Units** | `$INSUNITS` | From IR (or Metric `4` = mm) | Retains original scale and insertion units captured from the source drawing. |
-| **Measurement** | `$MEASUREMENT` | `1` (Metric) / `0` (Imperial) | Controls default linetype definitions and hatch pattern scaling matching the source drawing. |
-| **Vector Geometry** | `primitives` | Native Analytic Vectors | `ARC`, `CIRCLE`, `LWPOLYLINE`, `ELLIPSE`, and `SPLINE` are preserved mathematically without polygonal faceting. |
-| **Block Topology** | `blocks` | Hierarchical `INSERT` + `BLOCK_RECORD` | Compact vector reuse. Components reference centralized symbol geometry definitions. |
-| **Attributes** | `attributes` | Attached `ATTRIB` tags | Component tags and instance attributes are bound to their respective block insertions. |
-| **Layer Fidelity** | `layers` | Explicit State Mapping | Layers retain `is_off`, `is_frozen`, `is_locked`, `color`, and `linetype` states verbatim. |
-| **Color Fidelity** | `color_mode` | TrueColor (24-bit RGB) + ACI | Preserves full 24-bit color fidelity with automatic fallback to standard AutoCAD Color Index. |
-| **Sanitization** | `zero_length_tol` | `1e-9` | Rejects degenerate micro-geometry without affecting legitimate fine details. |
-
-### 5 Curated Safe Presets
-
-| Preset | Target DXF | Space | Key Characteristics & Target Workflows |
-| :--- | :--- | :--- | :--- |
-| **`standard`** *(default)* | `R2013` (AC1027) | ModelSpace | High-fidelity master profile: native analytic curves, TrueColor, hierarchical blocks, full layers. |
-| **`cnc_cam`** | `R12` (AC1009) | ModelSpace | Flat 2D ($Z=0$), block definitions exploded, annotations & dimensions omitted to prevent cutting labels. |
-| **`arch_print`** | `R2013` (AC1027) | PaperSpace | Auto-provisions `Presentation_Sheet` layout tab with printable border and scaled viewport. |
-| **`web_lightweight`** | `R2000` (AC1015) | ModelSpace | Compact output for web viewers (three.js), stripped tables, ACI color, dimensions omitted. |
-| **`bim_overlay`** | `R2018` (AC1032) | ModelSpace | Strict world-origin coordinate lock; `IR_` layer prefix to prevent layer collisions in Revit. |
-
----
-
-## 🛡️ Developer Diagnostic Engine & Error Messages
-
-For production library consumers and external developers, `cad-ir-to-dxf` provides actionable, typed errors and compilation diagnostic telemetry instead of cryptic Python tracebacks.
-
-### 1. Custom Exception Hierarchy (`exceptions.py`)
-All exceptions inherit from `CadIrToDxfError` and carry three properties:
-* **`message`**: Clear explanation of what failed.
-* **`offender`**: The exact bad value, key, or entity causing the issue.
-* **`hint`**: Actionable guidance explaining how to resolve it.
-
-```python
-from cad_ir_to_dxf import compile_ir_to_dxf, InvalidPresetError, StrictModeViolationError
-
-try:
-    doc = compile_ir_to_dxf("plan.json", preset="cnc-cam")
-except InvalidPresetError as e:
-    print(e.message)   # "Unknown preset 'cnc-cam'. Did you mean 'cnc_cam'?"
-    print(e.hint)      # "Valid presets are: ['standard', 'cnc_cam', 'arch_print', ...]"
-    print(e.offender)  # "cnc-cam"
-```
-
-### 2. Compilation Diagnostics (`diagnostics.py`)
-Non-fatal events (e.g., auto-vivified layers, dropped micro-geometry, suppressed annotation text) are gathered into a structured diagnostic report:
-
-```python
-from cad_ir_to_dxf import compile_ir_to_dxf, CompilationDiagnostics
-
-diag = CompilationDiagnostics()
-doc = compile_ir_to_dxf("plan.json", preset="cnc_cam", diagnostics=diag)
-
-# Print human-readable summary to stderr
-diag.print_report()
-
-# Or inspect programmatically:
-report = diag.to_dict()
-```
-
-CLI usage:
+### Command Line Interface (CLI)
 ```bash
-# Print diagnostic report
-cad-ir-to-dxf plan.json --preset cnc_cam --diagnostics
+# Convert to standard DXF
+python -m cad_ir_to_dxf.cli drawing_ir.json -o drawing.dxf
 
-# Enforce strict validation (fail fast on any missing layer or degenerate geometry)
-cad-ir-to-dxf plan.json --preset standard --strict
+# Convert for CNC waterjet cutting
+python -m cad_ir_to_dxf.cli drawing_ir.json -o waterjet.dxf --preset cnc_cam
+
+# Exclude scratch or temporary layers
+python -m cad_ir_to_dxf.cli drawing_ir.json -o clean.dxf --exclude-layers "TEMP*,DEFPOINTS"
 ```
 
 ---
 
-## 🧪 Test Results
+## 📄 License
 
-```
-Ran 85 tests in 0.460s — OK (0 failures, 0 errors)
-
-TestSanitizer                  (14 tests) — zero-length lines, NaN/Inf coords, scale clamping
-TestCompilerSmoke              ( 8 tests) — smoke compilation of real-world example IRs
-TestCompilerFidelity           ( 8 tests) — layer fidelity, block geometry, BYLAYER colour
-TestBoundaryConditions         ( 4 tests) — empty IR, degenerate geometry, missing block placeholder
-TestPresetResolver             ( 7 tests) — preset profile defaults, enum and string parsing
-TestAdvancedOptionsOverrides   ( 9 tests) — version, geometry, filtering, layout, styling overrides
-TestPresetCompilationSmoke     ( 6 tests) — all 5 presets compile valid DXF outputs
-TestPresetBehaviourFunctional  (10 tests) — flatten_z, layer prefixes, layer filtering, PaperSpace
-TestExceptions                 ( 9 tests) — typed errors, actionable hints, offender inspection
-TestStrictMode                 ( 3 tests) — strict-mode enforcement for layers, blocks, geometry
-TestDiagnostics                ( 5 tests) — diagnostic telemetry, print_report, and to_dict
-```
-
----
-
-## 🔗 Ecosystem
-
-| Repository | Role |
-| :--- | :--- |
-| [`cad-extractor-ir`](https://github.com/saikat-crypto/cad-extractor-ir) | DWG → LAVINCI_CAD_IR_V3 (the extractor / source) |
-| `cad-ir-to-dxf` *(this repo)* | LAVINCI_CAD_IR_V3 → DXF (this compiler) |
-| `cad-ir-to-svg` *(coming soon)* | LAVINCI_CAD_IR_V3 → SVG |
-| `cad-ir-to-pdf` *(coming soon)* | LAVINCI_CAD_IR_V3 → PDF |
-
----
-
-## 📄 License & Credits
-
-* **Author**: [Saikat Dutta Chowdhury](https://github.com/saikat-crypto)
-* **Project**: Part of the **La Vinci** engineering initiative.
-* **License**: Licensed under the [MIT License](LICENSE).
+Licensed under the [MIT License](LICENSE).
